@@ -1,20 +1,36 @@
+//! WASAPI session tracking across every active render endpoint.
+//!
+//! Sessions are enumerated on *all* active output devices (not just the
+//! default) so per-app routing and default-device switches never lose track of
+//! an application. An `IMMNotificationClient` watches for device changes
+//! (added / removed / enabled / disabled / default switched) and posts
+//! [`WM_DEVICES_CHANGED`] to the main thread, which responds by calling
+//! [`AudioManager::rebuild`].
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{implement, Interface, GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, LPARAM, WPARAM};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, AudioSessionDisconnectReason, AudioSessionState,
-    AudioSessionStateExpired, IAudioSessionControl, IAudioSessionControl2,
-    IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2,
-    IAudioSessionNotification, IAudioSessionNotification_Impl, IMMDeviceEnumerator,
-    ISimpleAudioVolume, MMDeviceEnumerator,
+    eRender, AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateExpired,
+    EDataFlow, ERole, IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents,
+    IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification,
+    IAudioSessionNotification_Impl, IMMDeviceEnumerator, IMMNotificationClient,
+    IMMNotificationClient_Impl, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE,
+    DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
+
+/// Thread message posted to the main thread whenever the set of audio devices
+/// changes; the main loop responds by calling [`AudioManager::rebuild`].
+pub const WM_DEVICES_CHANGED: u32 = WM_APP + 1;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -23,8 +39,8 @@ pub struct Session {
     pub name: String,
     pub pid: u32,
     pub volume: ISimpleAudioVolume,
-    _control: IAudioSessionControl2,
-    _events: IAudioSessionEvents,
+    control: IAudioSessionControl2,
+    events: IAudioSessionEvents,
 }
 
 pub struct State {
@@ -43,54 +59,129 @@ impl State {
     }
 }
 
-pub struct AudioManager {
-    pub state: Arc<Mutex<State>>,
+/// One session manager + notifier per active render endpoint.
+struct Attachment {
     manager: IAudioSessionManager2,
     notifier: IAudioSessionNotification,
 }
 
+pub struct AudioManager {
+    pub state: Arc<Mutex<State>>,
+    enumerator: IMMDeviceEnumerator,
+    watcher: IMMNotificationClient,
+    attachments: Vec<Attachment>,
+}
+
 impl AudioManager {
-    pub fn new() -> windows::core::Result<Self> {
+    /// `main_thread_id` receives [`WM_DEVICES_CHANGED`] when devices change.
+    pub fn new(main_thread_id: u32) -> windows::core::Result<Self> {
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-            let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
 
             let state = Arc::new(Mutex::new(State {
                 sessions: Vec::new(),
                 selection: None,
             }));
 
-            let notifier: IAudioSessionNotification = SessionNotifier {
-                state: state.clone(),
+            let watcher: IMMNotificationClient = DeviceWatcher {
+                thread_id: main_thread_id,
             }
             .into();
-            manager.RegisterSessionNotification(&notifier)?;
+            // Best-effort: without it we just miss hot-plug rebuilds.
+            let _ = enumerator.RegisterEndpointNotificationCallback(&watcher);
 
-            // Enumerate existing sessions — this also primes the notification pump
-            // so OnSessionCreated starts firing for future sessions.
-            let session_enum = manager.GetSessionEnumerator()?;
-            let count = session_enum.GetCount()?;
-            for i in 0..count {
-                if let Ok(ctrl) = session_enum.GetSession(i) {
-                    let _ = add_session(&state, &ctrl);
-                }
-            }
-
-            Ok(Self {
+            let mut mgr = Self {
                 state,
-                manager,
-                notifier,
-            })
+                enumerator,
+                watcher,
+                attachments: Vec::new(),
+            };
+            mgr.attach_all();
+            Ok(mgr)
+        }
+    }
+
+    /// Re-enumerate devices and sessions, preserving the current selection by
+    /// pid (or name, if the process re-appeared under a new session).
+    pub fn rebuild(&mut self) {
+        let previous = {
+            let guard = self.state.lock().unwrap();
+            guard.current().map(|s| (s.pid, s.name.clone()))
+        };
+        self.detach_all();
+        self.attach_all();
+        let mut guard = self.state.lock().unwrap();
+        let restored = previous.and_then(|(pid, name)| {
+            guard
+                .sessions
+                .iter()
+                .find(|s| s.pid == pid)
+                .or_else(|| guard.sessions.iter().find(|s| s.name == name))
+                .map(|s| s.id)
+        });
+        guard.selection = restored;
+    }
+
+    /// Attach a session manager to every active render endpoint and enumerate
+    /// its sessions — enumeration also primes the notification pump so
+    /// `OnSessionCreated` fires for future sessions on that endpoint.
+    fn attach_all(&mut self) {
+        unsafe {
+            let Ok(collection) = self
+                .enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+            else {
+                return;
+            };
+            let count = collection.GetCount().unwrap_or(0);
+            for i in 0..count {
+                let Ok(device) = collection.Item(i) else { continue };
+                let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
+                else {
+                    continue;
+                };
+                let notifier: IAudioSessionNotification = SessionNotifier {
+                    state: self.state.clone(),
+                }
+                .into();
+                if manager.RegisterSessionNotification(&notifier).is_err() {
+                    continue;
+                }
+                if let Ok(session_enum) = manager.GetSessionEnumerator() {
+                    let n = session_enum.GetCount().unwrap_or(0);
+                    for j in 0..n {
+                        if let Ok(ctrl) = session_enum.GetSession(j) {
+                            let _ = add_session(&self.state, &ctrl);
+                        }
+                    }
+                }
+                self.attachments.push(Attachment { manager, notifier });
+            }
+        }
+    }
+
+    fn detach_all(&mut self) {
+        unsafe {
+            for a in self.attachments.drain(..) {
+                let _ = a.manager.UnregisterSessionNotification(&a.notifier);
+            }
+            let mut guard = self.state.lock().unwrap();
+            for s in guard.sessions.drain(..) {
+                let _ = s.control.UnregisterAudioSessionNotification(&s.events);
+            }
+            guard.selection = None;
         }
     }
 }
 
 impl Drop for AudioManager {
     fn drop(&mut self) {
+        self.detach_all();
         unsafe {
-            let _ = self.manager.UnregisterSessionNotification(&self.notifier);
+            let _ = self
+                .enumerator
+                .UnregisterEndpointNotificationCallback(&self.watcher);
         }
     }
 }
@@ -116,17 +207,33 @@ fn add_session(state: &Arc<Mutex<State>>, ctrl: &IAudioSessionControl) -> window
         ctrl.RegisterAudioSessionNotification(&events)?;
 
         let mut guard = state.lock().unwrap();
-        // Avoid duplicates when a real process session is re-enumerated
-        if pid != 0 && guard.sessions.iter().any(|s| s.pid == pid) {
+        // Every endpoint hosts a system-sounds session; keep a single entry.
+        if pid == 0 && guard.sessions.iter().any(|s| s.pid == 0) {
             return Ok(());
+        }
+        if pid != 0 {
+            // An app that moves endpoints creates its new session before the
+            // old one expires — replace rather than skip, so the app never
+            // vanishes from the list. (The replaced session's notification is
+            // not unregistered here: we may be inside a WASAPI callback, where
+            // unregistering can deadlock. The stale registration only delivers
+            // events for an id we no longer track.)
+            let was_selected = guard
+                .sessions
+                .iter()
+                .any(|s| s.pid == pid && Some(s.id) == guard.selection);
+            guard.sessions.retain(|s| s.pid != pid);
+            if was_selected {
+                guard.selection = Some(id);
+            }
         }
         guard.sessions.push(Session {
             id,
             name,
             pid,
             volume: vol,
-            _control: ctrl2,
-            _events: events,
+            control: ctrl2,
+            events,
         });
     }
     Ok(())
@@ -200,6 +307,58 @@ pub fn restore_all_max(state: &Arc<Mutex<State>>) -> usize {
         n += 1;
     }
     n
+}
+
+/// Posts [`WM_DEVICES_CHANGED`] to the main thread on any device-set change.
+/// Callbacks arrive on WASAPI worker threads, so no COM or state work happens
+/// here — the main thread does the rebuild.
+#[implement(IMMNotificationClient)]
+struct DeviceWatcher {
+    thread_id: u32,
+}
+
+impl DeviceWatcher {
+    fn poke(&self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_DEVICES_CHANGED, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+impl IMMNotificationClient_Impl for DeviceWatcher_Impl {
+    fn OnDeviceStateChanged(
+        &self,
+        _device_id: &PCWSTR,
+        _new_state: DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        self.poke();
+        Ok(())
+    }
+    fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+        self.poke();
+        Ok(())
+    }
+    fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+        self.poke();
+        Ok(())
+    }
+    fn OnDefaultDeviceChanged(
+        &self,
+        _flow: EDataFlow,
+        _role: ERole,
+        _default_device_id: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        self.poke();
+        Ok(())
+    }
+    fn OnPropertyValueChanged(
+        &self,
+        _device_id: &PCWSTR,
+        _key: &PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
 }
 
 #[implement(IAudioSessionNotification)]
