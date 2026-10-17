@@ -46,6 +46,10 @@ pub struct Session {
 pub struct State {
     pub sessions: Vec<Session>,
     pub selection: Option<u64>,
+    /// Process names skipped by Left/Right navigation (see `hidden.rs`).
+    /// Hidden sessions are still tracked so the visibility dialog can list
+    /// them.
+    pub hidden: Vec<String>,
 }
 
 impl State {
@@ -56,6 +60,17 @@ impl State {
 
     pub fn current(&self) -> Option<&Session> {
         self.current_index().and_then(|i| self.sessions.get(i))
+    }
+
+    pub fn is_hidden(&self, s: &Session) -> bool {
+        crate::hidden::contains(&self.hidden, &s.name)
+    }
+
+    /// Indices into `sessions` of the sessions navigation can land on.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        (0..self.sessions.len())
+            .filter(|&i| !self.is_hidden(&self.sessions[i]))
+            .collect()
     }
 }
 
@@ -82,6 +97,7 @@ impl AudioManager {
             let state = Arc::new(Mutex::new(State {
                 sessions: Vec::new(),
                 selection: None,
+                hidden: crate::hidden::load(),
             }));
 
             let watcher: IMMNotificationClient = DeviceWatcher {
@@ -118,6 +134,7 @@ impl AudioManager {
                 .iter()
                 .find(|s| s.pid == pid)
                 .or_else(|| guard.sessions.iter().find(|s| s.name == name))
+                .filter(|s| !guard.is_hidden(s))
                 .map(|s| s.id)
         });
         guard.selection = restored;

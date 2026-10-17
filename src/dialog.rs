@@ -35,8 +35,8 @@ const CBS_HASSTRINGS: u32 = 0x0200;
 const WS_VSCROLL: u32 = 0x0020_0000;
 
 // Control identifiers. OK/Cancel reuse the conventional dialog ids.
-const ID_OK: i32 = 1;
-const ID_CANCEL: i32 = 2;
+pub(crate) const ID_OK: i32 = 1;
+pub(crate) const ID_CANCEL: i32 = 2;
 const ID_INPUT: i32 = 1001;
 const ID_OUTPUT: i32 = 1002;
 
@@ -126,8 +126,8 @@ pub fn show(
         // combo so screen readers adopt the label as the combo's name.
         let input_combo = make_combo(hwnd, hinst, ID_INPUT, "Input device:", 12)?;
         let output_combo = make_combo(hwnd, hinst, ID_OUTPUT, "Output device:", 66)?;
-        let _ok_btn = make_button(hwnd, hinst, ID_OK, "OK", 178)?;
-        let cancel_btn = make_button(hwnd, hinst, ID_CANCEL, "Cancel", 262)?;
+        let _ok_btn = make_button(hwnd, hinst, ID_OK, "OK", 178, 150)?;
+        let cancel_btn = make_button(hwnd, hinst, ID_CANCEL, "Cancel", 262, 150)?;
 
         state.input_combo = input_combo;
         state.output_combo = output_combo;
@@ -227,7 +227,7 @@ unsafe fn make_combo(
     Some(combo)
 }
 
-unsafe fn make_label(
+pub(crate) unsafe fn make_label(
     parent: HWND,
     hinstance: HINSTANCE,
     text: &str,
@@ -254,12 +254,13 @@ unsafe fn make_label(
     Some(label)
 }
 
-unsafe fn make_button(
+pub(crate) unsafe fn make_button(
     parent: HWND,
     hinstance: HINSTANCE,
     id: i32,
     text: &str,
     x: i32,
+    y: i32,
 ) -> Option<HWND> {
     let class = wide("BUTTON");
     let caption = wide(text);
@@ -269,7 +270,7 @@ unsafe fn make_button(
         PCWSTR(caption.as_ptr()),
         WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0),
         x,
-        150,
+        y,
         80,
         26,
         parent,
@@ -282,7 +283,7 @@ unsafe fn make_button(
     Some(button)
 }
 
-unsafe fn set_font(control: HWND) {
+pub(crate) unsafe fn set_font(control: HWND) {
     let font = GetStockObject(DEFAULT_GUI_FONT);
     SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 }

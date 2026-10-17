@@ -1,8 +1,10 @@
 #![windows_subsystem = "windows"]
 
+mod apps_dialog;
 mod audio;
 mod devices;
 mod dialog;
+mod hidden;
 mod prism;
 mod routing;
 
@@ -13,7 +15,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTME
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-    MOD_WIN, VK_BACK, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    MOD_SHIFT, MOD_WIN, VK_BACK, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
     VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -33,8 +35,13 @@ const HK_RESET_ALL: i32 = 10;
 const HK_MUTE: i32 = 11;
 const HK_DEVICES: i32 = 12;
 const HK_TOGGLE_MODE: i32 = 13;
+const HK_APPS: i32 = 14;
 
 const VOLUME_STEP: f32 = 0.02;
+
+// Spoken after the mode name whenever 0 switches modes.
+const APP_MODE_HELP: &str = "Left and Right select application, Up and Down change volume, Page Up and Page Down change volume by 20, Home sets 0 percent, End sets 100 percent, M toggles mute, Enter chooses devices for the application, Shift 0 chooses which applications to show, Backspace restores all applications to 100 percent, 0 switches to device mode, Q quits.";
+const DEVICE_MODE_HELP: &str = "Left and Right select device, Up and Down change device volume, Page Up and Page Down change device volume by 20, Home sets 0 percent, End sets 100 percent, M toggles device mute, Enter enables or disables the device, Shift 0 chooses which applications to show, Backspace restores all applications to 100 percent, 0 switches to application mode, Q quits.";
 
 /// What Left/Right, Up/Down, M and Enter act on.
 #[derive(Clone, Copy, PartialEq)]
@@ -48,6 +55,10 @@ enum Mode {
 
 fn mods() -> HOT_KEY_MODIFIERS {
     HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0 | MOD_WIN.0 | MOD_NOREPEAT.0)
+}
+
+fn shift_mods() -> HOT_KEY_MODIFIERS {
+    HOT_KEY_MODIFIERS(mods().0 | MOD_SHIFT.0)
 }
 
 fn say(speaker: &Option<prism::Speaker>, text: &str) {
@@ -70,20 +81,21 @@ fn announce_current(state: &Arc<Mutex<audio::State>>, speaker: &Option<prism::Sp
 
 fn navigate(state: &Arc<Mutex<audio::State>>, speaker: &Option<prism::Speaker>, step: i32) {
     let mut guard = state.lock().unwrap();
-    if guard.sessions.is_empty() {
+    let visible = guard.visible_indices();
+    if visible.is_empty() {
         drop(guard);
         say(speaker, "No audio applications");
         return;
     }
-    let last = guard.sessions.len() - 1;
-    let new_idx = match guard.current_index() {
+    let last = visible.len() - 1;
+    let pos = guard
+        .current_index()
+        .and_then(|i| visible.iter().position(|&v| v == i));
+    let new_pos = match pos {
         None => 0,
-        Some(i) => {
-            let i = i as i32 + step;
-            i.clamp(0, last as i32) as usize
-        }
+        Some(p) => (p as i32 + step).clamp(0, last as i32) as usize,
     };
-    guard.selection = Some(guard.sessions[new_idx].id);
+    guard.selection = Some(guard.sessions[visible[new_pos]].id);
     drop(guard);
     announce_current(state, speaker);
 }
@@ -364,6 +376,66 @@ fn open_device_dialog(state: &Arc<Mutex<audio::State>>, speaker: &Option<prism::
     );
 }
 
+/// Open the visibility dialog: running apps plus any remembered hidden ones,
+/// checked = shown. Accepting persists the unchecked names.
+fn open_apps_dialog(state: &Arc<Mutex<audio::State>>, speaker: &Option<prism::Speaker>) {
+    let mut entries: Vec<apps_dialog::AppEntry> = Vec::new();
+    {
+        let guard = state.lock().unwrap();
+        for s in &guard.sessions {
+            if !entries.iter().any(|e| hidden::same_name(&e.name, &s.name)) {
+                entries.push(apps_dialog::AppEntry {
+                    name: s.name.clone(),
+                    shown: !guard.is_hidden(s),
+                });
+            }
+        }
+        // Hidden apps that aren't running stay listed so they can be unhidden.
+        for name in &guard.hidden {
+            if !entries.iter().any(|e| hidden::same_name(&e.name, name)) {
+                entries.push(apps_dialog::AppEntry {
+                    name: name.clone(),
+                    shown: false,
+                });
+            }
+        }
+    }
+    if entries.is_empty() {
+        say(speaker, "No audio applications");
+        return;
+    }
+    entries.sort_by_key(|e| e.name.to_lowercase());
+
+    let Some(shown) = apps_dialog::show(&entries) else {
+        return; // cancelled
+    };
+    let hidden_names: Vec<String> = entries
+        .iter()
+        .zip(&shown)
+        .filter(|(_, &shown)| !shown)
+        .map(|(e, _)| e.name.clone())
+        .collect();
+    let saved = hidden::save(&hidden_names);
+    let count = hidden_names.len();
+    {
+        let mut guard = state.lock().unwrap();
+        guard.hidden = hidden_names;
+        let selection_hidden = guard.current().is_some_and(|s| guard.is_hidden(s));
+        if selection_hidden {
+            guard.selection = None;
+        }
+    }
+    if saved.is_err() {
+        say(speaker, "Could not save hidden applications");
+    } else if count == 0 {
+        say(speaker, "All applications shown");
+    } else if count == 1 {
+        say(speaker, "1 application hidden");
+    } else {
+        say(speaker, &format!("{} applications hidden", count));
+    }
+}
+
 fn main() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -397,6 +469,7 @@ fn main() {
         let _ = RegisterHotKey(h, HK_MUTE, mods(), b'M' as u32);
         let _ = RegisterHotKey(h, HK_DEVICES, mods(), VK_RETURN.0 as u32);
         let _ = RegisterHotKey(h, HK_TOGGLE_MODE, mods(), b'0' as u32);
+        let _ = RegisterHotKey(h, HK_APPS, shift_mods(), b'0' as u32);
     }
 
     say(&speaker, "Audio manager ready");
@@ -467,21 +540,40 @@ fn main() {
                             match nav.current() {
                                 Some(e) => say(
                                     &speaker,
-                                    &format!("Device mode, {}", device_description(e)),
+                                    &format!(
+                                        "Device mode, {}. {}",
+                                        device_description(e),
+                                        DEVICE_MODE_HELP
+                                    ),
                                 ),
-                                None => say(&speaker, "Device mode, no audio devices"),
+                                None => say(
+                                    &speaker,
+                                    &format!("Device mode, no audio devices. {}", DEVICE_MODE_HELP),
+                                ),
                             }
                             Mode::Devices
                         }
                         Mode::Devices => {
                             let name = state.lock().unwrap().current().map(|s| s.name.clone());
                             match name {
-                                Some(n) => say(&speaker, &format!("Application mode, {}", n)),
-                                None => say(&speaker, "Application mode"),
+                                Some(n) => say(
+                                    &speaker,
+                                    &format!("Application mode, {}. {}", n, APP_MODE_HELP),
+                                ),
+                                None => say(
+                                    &speaker,
+                                    &format!("Application mode. {}", APP_MODE_HELP),
+                                ),
                             }
                             Mode::Apps
                         }
                     };
+                }
+                HK_APPS => {
+                    open_apps_dialog(&state, &speaker);
+                    // Same as the device picker: catch up on device
+                    // notifications dropped by the nested dialog loop.
+                    manager.rebuild();
                 }
                 HK_RESET_ALL => {
                     let n = audio::restore_all_max(&state);
@@ -533,6 +625,7 @@ fn main() {
         let _ = UnregisterHotKey(h, HK_MUTE);
         let _ = UnregisterHotKey(h, HK_DEVICES);
         let _ = UnregisterHotKey(h, HK_TOGGLE_MODE);
+        let _ = UnregisterHotKey(h, HK_APPS);
     }
 
     drop(manager);
