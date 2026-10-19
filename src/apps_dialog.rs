@@ -1,5 +1,6 @@
-//! The Shift+0 application-visibility dialog: a checkbox list of apps, where
-//! unchecked apps are skipped by Left/Right navigation.
+//! The Shift+0 visibility dialog: a checkbox list of apps (application mode)
+//! or devices (device mode), where unchecked entries are skipped by Left/Right
+//! navigation.
 //!
 //! Built from a standard `SysListView32` with `LVS_EX_CHECKBOXES`, so screen
 //! readers announce each row as a check box with its checked state, and Space
@@ -10,7 +11,7 @@
 use std::ffi::c_void;
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LIST_VIEW_ITEM_STATE_FLAGS,
@@ -20,21 +21,21 @@ use windows::Win32::UI::Controls::{
     LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
     WC_LISTVIEWW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, IsDialogMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HMENU, MSG,
-    SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_KEYDOWN, WNDCLASSEXW, WS_BORDER, WS_CAPTION,
+    CreateWindowExW, DestroyWindow, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, ShowWindow, CW_USEDEFAULT, GWLP_USERDATA, HMENU, SW_SHOW, WINDOW_STYLE,
+    WNDCLASSEXW, WS_BORDER, WS_CAPTION,
     WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_OVERLAPPED,
     WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::devices::wide;
-use crate::dialog::{make_button, make_label, set_font, ID_CANCEL, ID_OK};
+use crate::dialog::{
+    make_button, make_label, modal_wndproc, run_modal, set_font, ModalState, ID_CANCEL, ID_OK,
+};
 
 const ID_LIST: i32 = 1001;
-const LIST_LABEL: &str = "Applications to show:";
 
 // Checkbox state lives in the state-image bits: image 1 = unchecked,
 // image 2 = checked.
@@ -47,15 +48,20 @@ pub struct AppEntry {
     pub shown: bool,
 }
 
-struct DialogState {
-    cancel_btn: HWND,
-    accepted: bool,
-    done: bool,
+/// Show the modal visibility dialog for applications.
+pub fn show(entries: &[AppEntry]) -> Option<Vec<bool>> {
+    show_with("Applications to show", entries)
 }
 
-/// Show the modal visibility dialog. Returns the `shown` flag for each entry
-/// (same order as `entries`) if accepted, `None` if cancelled or on failure.
-pub fn show(entries: &[AppEntry]) -> Option<Vec<bool>> {
+/// Show the modal visibility dialog for devices.
+pub fn show_devices(entries: &[AppEntry]) -> Option<Vec<bool>> {
+    show_with("Devices to show", entries)
+}
+
+/// Show the modal visibility dialog titled `title` (also used, with a colon,
+/// as the list's label). Returns the `shown` flag for each entry (same order
+/// as `entries`) if accepted, `None` if cancelled or on failure.
+fn show_with(title: &str, entries: &[AppEntry]) -> Option<Vec<bool>> {
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -68,7 +74,7 @@ pub fn show(entries: &[AppEntry]) -> Option<Vec<bool>> {
         // Re-registering fails harmlessly; the class lives for the process.
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
+            lpfnWndProc: Some(modal_wndproc),
             hInstance: hinst,
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
                 (windows::Win32::Graphics::Gdi::COLOR_BTNFACE.0 as isize + 1) as *mut c_void,
@@ -78,11 +84,11 @@ pub fn show(entries: &[AppEntry]) -> Option<Vec<bool>> {
         };
         RegisterClassExW(&wc);
 
-        let title = wide("Applications to show");
+        let wtitle = wide(title);
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
             PCWSTR(class_name.as_ptr()),
-            PCWSTR(title.as_ptr()),
+            PCWSTR(wtitle.as_ptr()),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -96,50 +102,21 @@ pub fn show(entries: &[AppEntry]) -> Option<Vec<bool>> {
         .ok()?;
 
         // Label first so screen readers adopt it as the list's name.
-        make_label(hwnd, hinst, LIST_LABEL, 12)?;
-        let list = make_list(hwnd, hinst)?;
+        make_label(hwnd, hinst, &format!("{}:", title), 12)?;
+        let list = make_list(hwnd, hinst, title)?;
         let _ok_btn = make_button(hwnd, hinst, ID_OK, "OK", 178, 290)?;
         let cancel_btn = make_button(hwnd, hinst, ID_CANCEL, "Cancel", 262, 290)?;
 
         populate(list, entries);
 
-        let state_ptr = Box::into_raw(Box::new(DialogState {
-            cancel_btn,
-            accepted: false,
-            done: false,
-        }));
+        let state_ptr = Box::into_raw(Box::new(ModalState::new(cancel_btn)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(list);
 
-        let mut msg = MSG::default();
-        loop {
-            if (*state_ptr).done {
-                break;
-            }
-            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                break; // WM_QUIT
-            }
-            if msg.message == WM_KEYDOWN {
-                let vk = msg.wParam.0 as u16;
-                if vk == VK_RETURN.0 {
-                    (*state_ptr).accepted = GetFocus() != (*state_ptr).cancel_btn;
-                    (*state_ptr).done = true;
-                    continue;
-                }
-                if vk == VK_ESCAPE.0 {
-                    (*state_ptr).accepted = false;
-                    (*state_ptr).done = true;
-                    continue;
-                }
-            }
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        run_modal(hwnd, state_ptr);
 
         let result = if (*state_ptr).accepted {
             Some((0..entries.len()).map(|i| is_checked(list, i)).collect())
@@ -154,8 +131,8 @@ pub fn show(entries: &[AppEntry]) -> Option<Vec<bool>> {
     }
 }
 
-unsafe fn make_list(parent: HWND, hinstance: HINSTANCE) -> Option<HWND> {
-    let name = wide(LIST_LABEL.trim_end_matches(':'));
+unsafe fn make_list(parent: HWND, hinstance: HINSTANCE, name: &str) -> Option<HWND> {
+    let name = wide(name);
     let list = CreateWindowExW(
         WS_EX_CLIENTEDGE,
         WC_LISTVIEWW,
@@ -245,35 +222,4 @@ unsafe fn is_checked(list: HWND, index: usize) -> bool {
     )
     .0 as u32;
     state & LVIS_STATEIMAGEMASK.0 == STATE_CHECKED
-}
-
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as i32;
-            if id == ID_OK || id == ID_CANCEL {
-                finish(hwnd, id == ID_OK);
-                return LRESULT(0);
-            }
-        }
-        WM_CLOSE => {
-            finish(hwnd, false);
-            return LRESULT(0);
-        }
-        _ => {}
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-unsafe fn finish(hwnd: HWND, accepted: bool) {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogState;
-    if !ptr.is_null() {
-        (*ptr).accepted = accepted;
-        (*ptr).done = true;
-    }
 }

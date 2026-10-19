@@ -5,6 +5,8 @@ mod audio;
 mod devices;
 mod dialog;
 mod hidden;
+mod mirror;
+mod mirror_dialog;
 mod prism;
 mod routing;
 
@@ -36,12 +38,13 @@ const HK_MUTE: i32 = 11;
 const HK_DEVICES: i32 = 12;
 const HK_TOGGLE_MODE: i32 = 13;
 const HK_APPS: i32 = 14;
+const HK_MIRROR: i32 = 15;
 
 const VOLUME_STEP: f32 = 0.02;
 
 // Spoken after the mode name whenever 0 switches modes.
-const APP_MODE_HELP: &str = "Left and Right select application, Up and Down change volume, Page Up and Page Down change volume by 20, Home sets 0 percent, End sets 100 percent, M toggles mute, Enter chooses devices for the application, Shift 0 chooses which applications to show, Backspace restores all applications to 100 percent, 0 switches to device mode, Q quits.";
-const DEVICE_MODE_HELP: &str = "Left and Right select device, Up and Down change device volume, Page Up and Page Down change device volume by 20, Home sets 0 percent, End sets 100 percent, M toggles device mute, Enter enables or disables the device, Shift 0 chooses which applications to show, Backspace restores all applications to 100 percent, 0 switches to application mode, Q quits.";
+const APP_MODE_HELP: &str = "Left and Right select application, Up and Down change volume, Page Up and Page Down change volume by 20, Home sets 0 percent, End sets 100 percent, M toggles mute, Enter chooses devices for the application, Shift 0 chooses which applications to show, Shift Enter duplicates an output device to another device, Backspace restores all applications to 100 percent, 0 switches to device mode, Q quits.";
+const DEVICE_MODE_HELP: &str = "Left and Right select device, Up and Down change device volume, Page Up and Page Down change device volume by 20, Home sets 0 percent, End sets 100 percent, M toggles device mute, Enter enables or disables the device, Shift 0 chooses which devices to show, Shift Enter duplicates the selected output device to another device, Backspace restores all applications to 100 percent, 0 switches to application mode, Q quits.";
 
 /// What Left/Right, Up/Down, M and Enter act on.
 #[derive(Clone, Copy, PartialEq)]
@@ -147,10 +150,12 @@ fn toggle_mute(state: &Arc<Mutex<audio::State>>, speaker: &Option<prism::Speaker
 }
 
 /// Device-mode navigation state. Selection is kept by endpoint id so it
-/// survives re-enumeration.
+/// survives re-enumeration. Hidden devices stay in `devices` (so the Shift+0
+/// dialog can list them) and are skipped only by `visible_indices()`.
 struct DeviceNav {
     devices: Vec<devices::Endpoint>,
     selected: Option<Vec<u16>>,
+    hidden: Vec<hidden::HiddenDevice>,
 }
 
 impl DeviceNav {
@@ -158,7 +163,19 @@ impl DeviceNav {
         Self {
             devices: Vec::new(),
             selected: None,
+            hidden: hidden::load_devices(),
         }
+    }
+
+    fn is_hidden(&self, e: &devices::Endpoint) -> bool {
+        hidden::device_hidden(&self.hidden, &devices::id_string(&e.id))
+    }
+
+    /// Indices into `devices` that Left/Right may land on.
+    fn visible_indices(&self) -> Vec<usize> {
+        (0..self.devices.len())
+            .filter(|&i| !self.is_hidden(&self.devices[i]))
+            .collect()
     }
 
     fn refresh(&mut self) {
@@ -179,7 +196,8 @@ impl DeviceNav {
         let default = devices::default_output_id();
         let pick = default
             .and_then(|id| self.devices.iter().find(|d| d.id == id))
-            .or_else(|| self.devices.first());
+            .filter(|d| !self.is_hidden(d))
+            .or_else(|| self.devices.iter().find(|d| !self.is_hidden(d)));
         self.selected = pick.map(|d| d.id.clone());
     }
 
@@ -213,15 +231,20 @@ fn device_description(e: &devices::Endpoint) -> String {
 
 fn navigate_devices(nav: &mut DeviceNav, speaker: &Option<prism::Speaker>, step: i32) {
     nav.refresh();
-    if nav.devices.is_empty() {
+    let visible = nav.visible_indices();
+    if visible.is_empty() {
         say(speaker, "No audio devices");
         return;
     }
-    let last = nav.devices.len() - 1;
-    let new_idx = match nav.index() {
+    let last = visible.len() - 1;
+    let pos = nav
+        .index()
+        .and_then(|i| visible.iter().position(|&v| v == i));
+    let new_pos = match pos {
         None => 0,
-        Some(i) => (i as i32 + step).clamp(0, last as i32) as usize,
+        Some(p) => (p as i32 + step).clamp(0, last as i32) as usize,
     };
+    let new_idx = visible[new_pos];
     nav.selected = Some(nav.devices[new_idx].id.clone());
     say(speaker, &device_description(&nav.devices[new_idx]));
 }
@@ -436,6 +459,164 @@ fn open_apps_dialog(state: &Arc<Mutex<audio::State>>, speaker: &Option<prism::Sp
     }
 }
 
+/// Device-mode Shift+0: the same checklist, listing present devices plus any
+/// remembered hidden ones that are unplugged. Accepting persists the unchecked
+/// devices by endpoint id.
+fn open_devices_dialog(nav: &mut DeviceNav, speaker: &Option<prism::Speaker>) {
+    nav.refresh();
+    let mut entries: Vec<apps_dialog::AppEntry> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    for e in &nav.devices {
+        let kind = if e.is_input { "input" } else { "output" };
+        entries.push(apps_dialog::AppEntry {
+            name: format!("{} ({})", e.name, kind),
+            shown: !nav.is_hidden(e),
+        });
+        ids.push(devices::id_string(&e.id));
+    }
+    for h in &nav.hidden {
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(&h.id)) {
+            let name = if h.name.is_empty() {
+                h.id.clone()
+            } else {
+                h.name.clone()
+            };
+            entries.push(apps_dialog::AppEntry {
+                name: format!("{} (not connected)", name),
+                shown: false,
+            });
+            ids.push(h.id.clone());
+        }
+    }
+    if entries.is_empty() {
+        say(speaker, "No audio devices");
+        return;
+    }
+
+    let Some(shown) = apps_dialog::show_devices(&entries) else {
+        return; // cancelled
+    };
+    let hidden_devices: Vec<hidden::HiddenDevice> = ids
+        .iter()
+        .zip(&shown)
+        .filter(|(_, &shown)| !shown)
+        .map(|(id, _)| {
+            let name = nav
+                .devices
+                .iter()
+                .find(|e| devices::id_string(&e.id).eq_ignore_ascii_case(id))
+                .map(|e| e.name.clone())
+                .or_else(|| {
+                    nav.hidden
+                        .iter()
+                        .find(|h| h.id.eq_ignore_ascii_case(id))
+                        .map(|h| h.name.clone())
+                })
+                .unwrap_or_default();
+            hidden::HiddenDevice {
+                id: id.clone(),
+                name,
+            }
+        })
+        .collect();
+    let saved = hidden::save_devices(&hidden_devices);
+    let count = hidden_devices.len();
+    nav.hidden = hidden_devices;
+    if nav.current().is_some_and(|e| nav.is_hidden(e)) {
+        nav.selected = None;
+    }
+    if saved.is_err() {
+        say(speaker, "Could not save hidden devices");
+    } else if count == 0 {
+        say(speaker, "All devices shown");
+    } else if count == 1 {
+        say(speaker, "1 device hidden");
+    } else {
+        say(speaker, &format!("{} devices hidden", count));
+    }
+}
+
+/// Shift+Enter with no duplication running: ask for source / target / latency
+/// and start the mirror engine. The source combo opens on the device selected
+/// in device mode (or the default output), the target on the last-used one.
+fn open_mirror_dialog(
+    nav: &DeviceNav,
+    mode: Mode,
+    speaker: &Option<prism::Speaker>,
+    main_thread: u32,
+) -> Option<mirror::Mirror> {
+    let outputs = devices::outputs();
+    if outputs.len() < 2 {
+        say(speaker, "Duplicating needs at least two output devices");
+        return None;
+    }
+
+    let find = |id: &[u16]| -> Option<usize> {
+        let wanted = devices::id_string(id);
+        outputs
+            .iter()
+            .position(|d| devices::id_string(&d.id).eq_ignore_ascii_case(&wanted))
+    };
+    let source_idx = match mode {
+        Mode::Devices => nav
+            .current()
+            .filter(|e| !e.is_input && e.enabled)
+            .and_then(|e| find(&e.id)),
+        Mode::Apps => None,
+    }
+    .or_else(|| devices::default_output_id().and_then(|id| find(&id)))
+    .unwrap_or(0);
+
+    let prefs = mirror::Prefs::load();
+    let target_idx = prefs
+        .target_id
+        .as_deref()
+        .and_then(|saved| {
+            outputs
+                .iter()
+                .position(|d| devices::id_string(&d.id).eq_ignore_ascii_case(saved))
+        })
+        .filter(|&i| i != source_idx)
+        .or_else(|| (0..outputs.len()).find(|&i| i != source_idx))
+        .unwrap_or(0);
+
+    let choice = mirror_dialog::show(&outputs, source_idx, target_idx, prefs.latency)?;
+    if choice.source == choice.target {
+        say(speaker, "Choose two different devices");
+        return None;
+    }
+    let source = &outputs[choice.source];
+    let target = &outputs[choice.target];
+    mirror::Prefs::save(&target.id, choice.latency);
+
+    match mirror::Mirror::start(
+        &source.id,
+        &source.name,
+        &target.id,
+        &target.name,
+        choice.latency,
+        main_thread,
+    ) {
+        Ok(m) => {
+            say(
+                speaker,
+                &format!(
+                    "Duplicating {} to {}, {}, about {} milliseconds delay. Press Shift Enter again to stop.",
+                    source.name,
+                    target.name,
+                    choice.latency.name(),
+                    m.stats.estimated_delay_ms()
+                ),
+            );
+            Some(m)
+        }
+        Err(e) => {
+            say(speaker, &format!("Could not start duplication: {}", e));
+            None
+        }
+    }
+}
+
 fn main() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -453,6 +634,7 @@ fn main() {
     let state = manager.state.clone();
     let mut mode = Mode::Apps;
     let mut nav = DeviceNav::new();
+    let mut mirror: Option<mirror::Mirror> = None;
 
     unsafe {
         let h = HWND(std::ptr::null_mut());
@@ -470,6 +652,7 @@ fn main() {
         let _ = RegisterHotKey(h, HK_DEVICES, mods(), VK_RETURN.0 as u32);
         let _ = RegisterHotKey(h, HK_TOGGLE_MODE, mods(), b'0' as u32);
         let _ = RegisterHotKey(h, HK_APPS, shift_mods(), b'0' as u32);
+        let _ = RegisterHotKey(h, HK_MIRROR, shift_mods(), VK_RETURN.0 as u32);
     }
 
     say(&speaker, "Audio manager ready");
@@ -570,10 +753,25 @@ fn main() {
                     };
                 }
                 HK_APPS => {
-                    open_apps_dialog(&state, &speaker);
+                    match mode {
+                        Mode::Apps => open_apps_dialog(&state, &speaker),
+                        Mode::Devices => open_devices_dialog(&mut nav, &speaker),
+                    }
                     // Same as the device picker: catch up on device
                     // notifications dropped by the nested dialog loop.
                     manager.rebuild();
+                }
+                HK_MIRROR => {
+                    if let Some(m) = mirror.take() {
+                        let desc = format!("{} to {}", m.source_name, m.target_name);
+                        drop(m);
+                        say(&speaker, &format!("Stopped duplicating {}", desc));
+                    } else {
+                        mirror = open_mirror_dialog(&nav, mode, &speaker, main_thread);
+                        // Catch up on device notifications dropped by the
+                        // nested dialog loop.
+                        manager.rebuild();
+                    }
                 }
                 HK_RESET_ALL => {
                     let n = audio::restore_all_max(&state);
@@ -603,6 +801,16 @@ fn main() {
             if mode == Mode::Devices {
                 nav.refresh();
             }
+        } else if msg.message == mirror::WM_MIRROR_STOPPED && msg.hwnd.0.is_null() {
+            if let Some(m) = mirror.take() {
+                let reason = m.failure().unwrap_or_else(|| "unknown error".to_string());
+                let target = m.target_name.clone();
+                drop(m);
+                say(
+                    &speaker,
+                    &format!("Duplication to {} stopped: {}", target, reason),
+                );
+            }
         }
 
         unsafe {
@@ -626,8 +834,10 @@ fn main() {
         let _ = UnregisterHotKey(h, HK_DEVICES);
         let _ = UnregisterHotKey(h, HK_TOGGLE_MODE);
         let _ = UnregisterHotKey(h, HK_APPS);
+        let _ = UnregisterHotKey(h, HK_MIRROR);
     }
 
+    drop(mirror);
     drop(manager);
     drop(speaker);
 

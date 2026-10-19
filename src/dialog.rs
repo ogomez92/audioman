@@ -57,14 +57,23 @@ pub struct DeviceSelection {
     pub output: Choice,
 }
 
-/// Window-proc-visible state, kept on the heap with its pointer stashed in
-/// `GWLP_USERDATA`.
-struct DialogState {
-    input_combo: HWND,
-    output_combo: HWND,
-    cancel_btn: HWND,
-    accepted: bool,
-    done: bool,
+/// Window-proc-visible state shared by every modal window in this program,
+/// kept on the heap with its pointer stashed in `GWLP_USERDATA`.
+pub(crate) struct ModalState {
+    /// Enter on this button cancels instead of accepting.
+    pub cancel_btn: HWND,
+    pub accepted: bool,
+    pub done: bool,
+}
+
+impl ModalState {
+    pub(crate) fn new(cancel_btn: HWND) -> Self {
+        Self {
+            cancel_btn,
+            accepted: false,
+            done: false,
+        }
+    }
 }
 
 /// Show the modal device picker for `app_name`. `preselect_*` are combo
@@ -86,7 +95,7 @@ pub fn show(
         // class persists for the process lifetime, so we just try every time.
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
+            lpfnWndProc: Some(modal_wndproc),
             hInstance: hinst,
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
                 (windows::Win32::Graphics::Gdi::COLOR_BTNFACE.0 as isize + 1) as *mut c_void,
@@ -114,14 +123,6 @@ pub fn show(
         )
         .ok()?;
 
-        let mut state = Box::new(DialogState {
-            input_combo: HWND::default(),
-            output_combo: HWND::default(),
-            cancel_btn: HWND::default(),
-            accepted: false,
-            done: false,
-        });
-
         // Create the controls. Order matters: each STATIC label precedes its
         // combo so screen readers adopt the label as the combo's name.
         let input_combo = make_combo(hwnd, hinst, ID_INPUT, "Input device:", 12)?;
@@ -129,55 +130,17 @@ pub fn show(
         let _ok_btn = make_button(hwnd, hinst, ID_OK, "OK", 178, 150)?;
         let cancel_btn = make_button(hwnd, hinst, ID_CANCEL, "Cancel", 262, 150)?;
 
-        state.input_combo = input_combo;
-        state.output_combo = output_combo;
-        state.cancel_btn = cancel_btn;
-
         populate(input_combo, inputs, preselect_input);
         populate(output_combo, outputs, preselect_output);
 
-        let state_ptr = Box::into_raw(state);
+        let state_ptr = Box::into_raw(Box::new(ModalState::new(cancel_btn)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(input_combo);
 
-        // Modal message loop. Runs on the main thread; the outer hotkey loop is
-        // suspended until this returns.
-        let mut msg = MSG::default();
-        loop {
-            if (*state_ptr).done {
-                break;
-            }
-            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                break; // WM_QUIT
-            }
-
-            if msg.message == WM_KEYDOWN {
-                let vk = msg.wParam.0 as u16;
-                let focus = GetFocus();
-                // If a combo's dropdown is open, let Enter/Esc act on the list
-                // (commit / dismiss) rather than the dialog.
-                let dropped =
-                    SendMessageW(focus, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0;
-                if !dropped && vk == VK_RETURN.0 {
-                    (*state_ptr).accepted = focus != (*state_ptr).cancel_btn;
-                    (*state_ptr).done = true;
-                    continue;
-                }
-                if !dropped && vk == VK_ESCAPE.0 {
-                    (*state_ptr).accepted = false;
-                    (*state_ptr).done = true;
-                    continue;
-                }
-            }
-
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        run_modal(hwnd, state_ptr);
 
         let accepted = (*state_ptr).accepted;
         let result = if accepted {
@@ -197,7 +160,44 @@ pub fn show(
     }
 }
 
-unsafe fn make_combo(
+/// Run the nested modal message loop on the main thread until `state.done`.
+/// Tab/Shift+Tab come from `IsDialogMessageW`; Enter accepts (unless focus is
+/// on the Cancel button) and Esc cancels, except while a combo's dropdown is
+/// open, where both act on the list instead.
+pub(crate) unsafe fn run_modal(hwnd: HWND, state_ptr: *mut ModalState) {
+    let mut msg = MSG::default();
+    loop {
+        if (*state_ptr).done {
+            break;
+        }
+        if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            break; // WM_QUIT
+        }
+
+        if msg.message == WM_KEYDOWN {
+            let vk = msg.wParam.0 as u16;
+            let focus = GetFocus();
+            let dropped = SendMessageW(focus, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0;
+            if !dropped && vk == VK_RETURN.0 {
+                (*state_ptr).accepted = focus != (*state_ptr).cancel_btn;
+                (*state_ptr).done = true;
+                continue;
+            }
+            if !dropped && vk == VK_ESCAPE.0 {
+                (*state_ptr).accepted = false;
+                (*state_ptr).done = true;
+                continue;
+            }
+        }
+
+        if !IsDialogMessageW(hwnd, &msg).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+pub(crate) unsafe fn make_combo(
     parent: HWND,
     hinstance: HINSTANCE,
     id: i32,
@@ -326,7 +326,9 @@ unsafe fn resolve_selection(combo: HWND, devices: &[DeviceInfo]) -> Choice {
     }
 }
 
-unsafe extern "system" fn wndproc(
+/// Window procedure shared by the modal windows: OK/Cancel buttons and the
+/// close box finish the loop; everything else is default-handled.
+pub(crate) unsafe extern "system" fn modal_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -350,7 +352,7 @@ unsafe extern "system" fn wndproc(
 }
 
 unsafe fn finish(hwnd: HWND, accepted: bool) {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogState;
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ModalState;
     if !ptr.is_null() {
         (*ptr).accepted = accepted;
         (*ptr).done = true;

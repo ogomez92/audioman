@@ -22,6 +22,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{
+    GetCurrentProcessId,
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -208,6 +209,11 @@ fn add_session(state: &Arc<Mutex<State>>, ctrl: &IAudioSessionControl) -> window
         let ctrl2: IAudioSessionControl2 = ctrl.cast()?;
         let vol: ISimpleAudioVolume = ctrl.cast()?;
         let pid = ctrl2.GetProcessId().unwrap_or(0);
+        // Our own streams (the duplication engine's silent clock stream and
+        // its render stream) are not something the user should navigate to.
+        if pid != 0 && pid == GetCurrentProcessId() {
+            return Ok(());
+        }
         let name = if pid == 0 {
             "System sounds".to_string()
         } else {

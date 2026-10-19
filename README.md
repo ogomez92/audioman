@@ -24,6 +24,10 @@ All hotkeys use **Ctrl + Win + Alt** as the modifier.
 | Page Up / Page Down | Volume +20% / -20% |
 | Home / End | Set volume to 0% / 100% |
 | M | Toggle mute |
+| Enter | Choose input/output devices for the selected app (device mode: enable/disable device) |
+| 0 | Switch between application mode and device mode |
+| Shift + 0 | Choose which applications (application mode) or devices (device mode) Left/Right cycle through |
+| Shift + Enter | Duplicate everything playing on one output device to another; press again to stop |
 | Backspace | Reset every app in the volume mixer to 100% and unmute |
 | Q | Quit |
 
