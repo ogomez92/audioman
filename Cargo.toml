@@ -5,6 +5,13 @@ edition = "2021"
 
 [dependencies]
 windows-core = "0.58"
+# SonicRoom streaming: sans-IO WebRTC (DTLS via Windows CNG, no OpenSSL), the
+# signaling WebSocket (TLS via SChannel) and libopus transpiled to Rust, so the
+# build still needs no C toolchain or external SDK.
+str0m = { version = "0.24", default-features = false, features = ["wincrypto"] }
+tungstenite = { version = "0.28", features = ["native-tls"] }
+serde_json = "1"
+unsafe-libopus = "0.2"
 
 [dependencies.windows]
 version = "0.58"
@@ -27,7 +34,12 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Networking_WinSock",
 ]
+
+# The transpiled Opus encoder is far too slow for real time unoptimized.
+[profile.dev.package.unsafe-libopus]
+opt-level = 3
 
 [profile.release]
 lto = true

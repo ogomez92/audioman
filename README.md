@@ -28,8 +28,11 @@ All hotkeys use **Ctrl + Win + Alt** as the modifier.
 | 0 | Switch between application mode and device mode |
 | Shift + 0 | Choose which applications (application mode) or devices (device mode) Left/Right cycle through |
 | Shift + Enter | Duplicate everything playing on one output device to another; press again to stop |
+| Shift + S | Stream an output device (everything playing on it) or a microphone into a SonicRoom room; press again to stop |
 | Backspace | Reset every app in the volume mixer to 100% and unmute |
 | Q | Quit |
+
+Streaming to SonicRoom asks for the server (or just paste a room link), the room, the name to show in the room, the device, mono or stereo (automatic: stereo for outputs, mono for microphones) and the quality: 5 ms packets for the lowest delay, 10 ms (the default), or 20 ms at a higher bitrate for the best quality. audioman joins as a music caster, so everyone in the room hears it and anyone there can remove it. Like duplication, a stream keeps going across restarts of audioman and resumes by itself after a lost connection or an unplugged device, until you stop it with Shift + S.
 
 Left / Right cycle through whatever's currently in the Windows volume mixer — including system sounds and any app that's opened an audio stream. The list updates live as apps start and stop playing; you don't need to refresh it.
 

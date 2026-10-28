@@ -18,11 +18,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, IsDialogMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow,
     SetWindowLongPtrW, ShowWindow, TranslateMessage, CB_ADDSTRING, CB_GETCURSEL,
     CB_GETDROPPEDSTATE, CB_SETCURSEL, CW_USEDEFAULT, GWLP_USERDATA, HMENU, MSG, SW_SHOW,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_KEYDOWN, WM_SETFONT, WNDCLASSEXW,
-    WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_OVERLAPPED, WS_SYSMENU,
+    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
+    WS_OVERLAPPED, WS_SYSMENU,
     WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -33,6 +34,7 @@ use crate::devices::{wide, DeviceInfo};
 const CBS_DROPDOWNLIST: u32 = 0x0003;
 const CBS_HASSTRINGS: u32 = 0x0200;
 const WS_VSCROLL: u32 = 0x0020_0000;
+const ES_AUTOHSCROLL: u32 = 0x0080;
 
 // Control identifiers. OK/Cancel reuse the conventional dialog ids.
 pub(crate) const ID_OK: i32 = 1;
@@ -227,6 +229,46 @@ pub(crate) unsafe fn make_combo(
     Some(combo)
 }
 
+/// A single-line text field named by the `STATIC` label created right
+/// before it, like [`make_combo`].
+pub(crate) unsafe fn make_edit(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    id: i32,
+    label: &str,
+    text: &str,
+    y: i32,
+) -> Option<HWND> {
+    make_label(parent, hinstance, label, y)?;
+    let class = wide("EDIT");
+    let initial = wide(text);
+    let edit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        PCWSTR(class.as_ptr()),
+        PCWSTR(initial.as_ptr()),
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL),
+        12,
+        y + 18,
+        330,
+        24,
+        parent,
+        HMENU(id as isize as *mut c_void),
+        hinstance,
+        None,
+    )
+    .ok()?;
+    set_font(edit);
+    Some(edit)
+}
+
+/// The text of an edit control (or any window).
+pub(crate) unsafe fn window_text(hwnd: HWND) -> String {
+    let len = GetWindowTextLengthW(hwnd).max(0) as usize;
+    let mut buf = vec![0u16; len + 1];
+    let n = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+    String::from_utf16_lossy(&buf[..n])
+}
+
 pub(crate) unsafe fn make_label(
     parent: HWND,
     hinstance: HINSTANCE,
@@ -302,7 +344,24 @@ unsafe fn populate(combo: HWND, devices: &[DeviceInfo], preselect: usize) {
     SendMessageW(combo, CB_SETCURSEL, WPARAM(sel), LPARAM(0));
 }
 
-unsafe fn selected_index(combo: HWND) -> Option<usize> {
+/// Fill a combo with plain `items` and select `preselect` (the first item
+/// if out of range).
+pub(crate) unsafe fn fill_combo<'a>(
+    combo: HWND,
+    items: impl Iterator<Item = &'a str>,
+    preselect: usize,
+) {
+    let mut count = 0usize;
+    for item in items {
+        let text = wide(item);
+        SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
+        count += 1;
+    }
+    let sel = if preselect < count { preselect } else { 0 };
+    SendMessageW(combo, CB_SETCURSEL, WPARAM(sel), LPARAM(0));
+}
+
+pub(crate) unsafe fn selected_index(combo: HWND) -> Option<usize> {
     let idx = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
     if idx < 0 {
         None

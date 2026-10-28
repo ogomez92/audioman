@@ -28,7 +28,8 @@
 //!    runs dry we pad silence and re-cushion. Both are glitches, but rare.
 //!
 //! Runtime failures (a device unplugged, the engine stalling) end the thread,
-//! which posts [`WM_MIRROR_STOPPED`] so the main loop can announce it.
+//! which posts [`WM_MIRROR_STOPPED`] so the main loop can announce it and
+//! retry until the devices are usable again.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -37,18 +38,16 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use windows::core::{w, Interface, PCWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient, IMMDevice,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
+    IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent,
@@ -58,6 +57,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
 
 use crate::devices::id_string;
 use crate::hidden::config_path;
+use crate::wasapi::{describe, fill_silence, open_stream, Format, Stream};
 
 /// Posted to the main thread when the engine stops on its own (device lost,
 /// engine stalled). The main loop drops its [`Mirror`] and announces
@@ -170,6 +170,72 @@ impl Prefs {
         }
         let text = format!("{}\r\n{}\r\n", id_string(target_id), latency.key());
         let _ = std::fs::write(p, text);
+    }
+}
+
+/// The duplication the user wants running, persisted in
+/// `%APPDATA%\audioman\active_mirror.txt` (line 1: source endpoint id, line
+/// 2: target endpoint id, line 3: latency key, lines 4-5: source / target
+/// names, spoken while a device is missing). Written when a duplication
+/// starts, removed only when the user stops it; quitting, a runtime failure
+/// or a device disappearing leaves it in place so it can be resumed.
+#[derive(Clone)]
+pub struct Active {
+    pub source_id: String,
+    pub target_id: String,
+    pub latency: Latency,
+    pub source_name: String,
+    pub target_name: String,
+}
+
+impl Active {
+    pub fn load() -> Option<Active> {
+        let text = std::fs::read_to_string(config_path("active_mirror.txt")?).ok()?;
+        let mut lines = text.lines().map(str::trim);
+        let source_id = lines.next().filter(|l| !l.is_empty())?.to_string();
+        let target_id = lines.next().filter(|l| !l.is_empty())?.to_string();
+        let latency = lines.next().and_then(Latency::parse)?;
+        // Files written before names were stored stop after the latency.
+        let mut name = |fallback: &str| {
+            lines
+                .next()
+                .filter(|l| !l.is_empty())
+                .unwrap_or(fallback)
+                .to_string()
+        };
+        let source_name = name("the source device");
+        let target_name = name("the target device");
+        Some(Active {
+            source_id,
+            target_id,
+            latency,
+            source_name,
+            target_name,
+        })
+    }
+
+    pub fn save(&self) {
+        let Some(p) = config_path("active_mirror.txt") else {
+            return;
+        };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = format!(
+            "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
+            self.source_id,
+            self.target_id,
+            self.latency.key(),
+            self.source_name,
+            self.target_name
+        );
+        let _ = std::fs::write(p, text);
+    }
+
+    pub fn clear() {
+        if let Some(p) = config_path("active_mirror.txt") {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -355,125 +421,6 @@ fn worker(
     }
 }
 
-/// An owned copy of a `WAVEFORMATEX` (+ any `WAVEFORMATEXTENSIBLE` tail), so
-/// the engine-allocated one can be freed immediately.
-struct Format {
-    bytes: Vec<u8>,
-}
-
-impl Format {
-    unsafe fn mix_format(client: &IAudioClient) -> Result<Format, String> {
-        let p = client
-            .GetMixFormat()
-            .map_err(|e| format!("mix format unavailable: {}", e))?;
-        let header: WAVEFORMATEX = std::ptr::read_unaligned(p);
-        let len = std::mem::size_of::<WAVEFORMATEX>() + header.cbSize as usize;
-        let bytes = std::slice::from_raw_parts(p as *const u8, len).to_vec();
-        CoTaskMemFree(Some(p as *const c_void));
-        Ok(Format { bytes })
-    }
-
-    fn as_ptr(&self) -> *const WAVEFORMATEX {
-        self.bytes.as_ptr() as *const WAVEFORMATEX
-    }
-
-    fn header(&self) -> WAVEFORMATEX {
-        unsafe { std::ptr::read_unaligned(self.as_ptr()) }
-    }
-
-    fn frame_bytes(&self) -> usize {
-        self.header().nBlockAlign.max(1) as usize
-    }
-
-    fn rate(&self) -> u32 {
-        self.header().nSamplesPerSec.max(1)
-    }
-}
-
-/// One opened shared-mode stream plus the period it actually got.
-struct Stream {
-    client: IAudioClient,
-    /// Engine period in frames (best knowledge; the default period if the
-    /// low-latency path was unavailable).
-    period_frames: u32,
-    buffer_frames: u32,
-}
-
-/// Open an event-driven shared-mode stream on `device` in `fmt`, preferring
-/// `IAudioClient3` with the minimum (or default) engine period and falling
-/// back to a classic `Initialize` with the engine's default buffering.
-unsafe fn open_stream(
-    device: &IMMDevice,
-    fmt: &Format,
-    extra_flags: u32,
-    latency: Latency,
-    event: HANDLE,
-    what: &str,
-) -> Result<Stream, String> {
-    let client: IAudioClient = device
-        .Activate(CLSCTX_ALL, None)
-        .map_err(|e| format!("{}: activation failed: {}", what, e))?;
-    let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | extra_flags;
-    let default_period = fmt.rate() / 100; // 10 ms
-    let mut period_frames = default_period;
-
-    let mut initialized = false;
-    if let Ok(client3) = client.cast::<IAudioClient3>() {
-        let (mut def, mut fund, mut min, mut max) = (0u32, 0u32, 0u32, 0u32);
-        if client3
-            .GetSharedModeEnginePeriod(fmt.as_ptr(), &mut def, &mut fund, &mut min, &mut max)
-            .is_ok()
-            && def > 0
-        {
-            let want = if latency.wants_min_period() && min > 0 {
-                min
-            } else {
-                def
-            };
-            #[cfg(test)]
-            eprintln!(
-                "{}: engine periods default {} fundamental {} min {} max {}, asking {}",
-                what, def, fund, min, max, want
-            );
-            let first = client3.InitializeSharedAudioStream(flags, want, fmt.as_ptr(), None);
-            #[cfg(test)]
-            if let Err(e) = &first {
-                eprintln!(
-                    "{}: InitializeSharedAudioStream({}) failed: {}",
-                    what, want, e
-                );
-            }
-            if first.is_ok() {
-                period_frames = want;
-                initialized = true;
-            } else if want != def
-                && client3
-                    .InitializeSharedAudioStream(flags, def, fmt.as_ptr(), None)
-                    .is_ok()
-            {
-                period_frames = def;
-                initialized = true;
-            }
-        }
-    }
-    if !initialized {
-        client
-            .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, fmt.as_ptr(), None)
-            .map_err(|e| format!("{}: could not open stream: {}", what, e))?;
-    }
-    client
-        .SetEventHandle(event)
-        .map_err(|e| format!("{}: event registration failed: {}", what, e))?;
-    let buffer_frames = client
-        .GetBufferSize()
-        .map_err(|e| format!("{}: buffer size unavailable: {}", what, e))?;
-    Ok(Stream {
-        client,
-        period_frames,
-        buffer_frames,
-    })
-}
-
 struct Pump {
     // Silent render stream on the source: the capture clock.
     clock: Stream,
@@ -527,7 +474,14 @@ impl Pump {
             let fmt = Format::mix_format(&probe)?;
             drop(probe);
 
-            let clock = open_stream(&source, &fmt, 0, cfg.latency, clock_event, "source device")?;
+            let clock = open_stream(
+                &source,
+                &fmt,
+                0,
+                cfg.latency.wants_min_period(),
+                clock_event,
+                "source device",
+            )?;
             let clock_render: IAudioRenderClient = clock
                 .client
                 .GetService()
@@ -569,7 +523,7 @@ impl Pump {
                 &target,
                 &fmt,
                 extra,
-                cfg.latency,
+                cfg.latency.wants_min_period(),
                 out_event,
                 "target device",
             ) {
@@ -580,7 +534,7 @@ impl Pump {
                     &target,
                     &fmt,
                     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                    cfg.latency,
+                    cfg.latency.wants_min_period(),
                     out_event,
                     "target device",
                 )?,
@@ -609,7 +563,8 @@ impl Pump {
 
             // Pre-fill the silent clock stream, then start everything. The
             // capture must be running before the first clock tick drains it.
-            fill_silence(&clock.client, &clock_render, clock.buffer_frames)?;
+            fill_silence(&clock.client, &clock_render, clock.buffer_frames)
+                .map_err(|e| format!("source device: could not prime: {}", e))?;
             capture_client
                 .Start()
                 .map_err(|e| format!("source device: capture start failed: {}", e))?;
@@ -667,13 +622,7 @@ impl Pump {
     /// Source engine period elapsed: top up the silent stream and move every
     /// pending loopback packet into the ring.
     unsafe fn on_clock_tick(&mut self) -> windows::core::Result<()> {
-        let padding = self.clock.client.GetCurrentPadding()?;
-        let avail = self.clock.buffer_frames.saturating_sub(padding);
-        if avail > 0 {
-            let _ = self.clock_render.GetBuffer(avail)?;
-            self.clock_render
-                .ReleaseBuffer(avail, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
-        }
+        fill_silence(&self.clock.client, &self.clock_render, self.clock.buffer_frames)?;
 
         loop {
             let next = self.capture.GetNextPacketSize()?;
@@ -758,35 +707,6 @@ impl Drop for Pump {
             let _ = CloseHandle(self.clock_event);
             let _ = CloseHandle(self.out_event);
         }
-    }
-}
-
-unsafe fn fill_silence(
-    client: &IAudioClient,
-    render: &IAudioRenderClient,
-    buffer_frames: u32,
-) -> Result<(), String> {
-    let padding = client
-        .GetCurrentPadding()
-        .map_err(|e| format!("source device: padding unavailable: {}", e))?;
-    let avail = buffer_frames.saturating_sub(padding);
-    if avail > 0 {
-        render
-            .GetBuffer(avail)
-            .map_err(|e| format!("source device: buffer unavailable: {}", e))?;
-        render
-            .ReleaseBuffer(avail, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)
-            .map_err(|e| format!("source device: buffer release failed: {}", e))?;
-    }
-    Ok(())
-}
-
-/// Turn a WASAPI error into something worth speaking.
-fn describe(e: windows::core::Error) -> String {
-    if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
-        "a device was disconnected".to_string()
-    } else {
-        format!("audio error {}", e)
     }
 }
 

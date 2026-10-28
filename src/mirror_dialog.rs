@@ -8,19 +8,19 @@
 use std::ffi::c_void;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, ShowWindow, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT,
-    GWLP_USERDATA, SW_SHOW, WNDCLASSEXW, WS_CAPTION, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
-    WS_OVERLAPPED, WS_SYSMENU,
+    CreateWindowExW, DestroyWindow, RegisterClassExW, SetForegroundWindow,
+    SetWindowLongPtrW, ShowWindow, CW_USEDEFAULT, GWLP_USERDATA, SW_SHOW, WNDCLASSEXW,
+    WS_CAPTION, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_OVERLAPPED, WS_SYSMENU,
 };
 
 use crate::devices::{wide, DeviceInfo};
 use crate::dialog::{
-    make_button, make_combo, modal_wndproc, run_modal, ModalState, ID_CANCEL, ID_OK,
+    fill_combo, make_button, make_combo, modal_wndproc, run_modal, selected_index, ModalState,
+    ID_CANCEL, ID_OK,
 };
 use crate::mirror::Latency;
 
@@ -84,17 +84,17 @@ pub fn show(
         let _ok_btn = make_button(hwnd, hinst, ID_OK, "Start", 178, 200)?;
         let cancel_btn = make_button(hwnd, hinst, ID_CANCEL, "Cancel", 262, 200)?;
 
-        populate(
+        fill_combo(
             source_combo,
             outputs.iter().map(|d| d.name.as_str()),
             preselect_source,
         );
-        populate(
+        fill_combo(
             target_combo,
             outputs.iter().map(|d| d.name.as_str()),
             preselect_target,
         );
-        populate(
+        fill_combo(
             latency_combo,
             Latency::ALL.iter().map(|l| l.label()),
             Latency::ALL
@@ -140,30 +140,5 @@ pub fn show(
         drop(Box::from_raw(state_ptr));
 
         result
-    }
-}
-
-unsafe fn populate<'a>(combo: HWND, items: impl Iterator<Item = &'a str>, preselect: usize) {
-    let mut count = 0usize;
-    for item in items {
-        let text = wide(item);
-        SendMessageW(
-            combo,
-            CB_ADDSTRING,
-            WPARAM(0),
-            LPARAM(text.as_ptr() as isize),
-        );
-        count += 1;
-    }
-    let sel = if preselect < count { preselect } else { 0 };
-    SendMessageW(combo, CB_SETCURSEL, WPARAM(sel), LPARAM(0));
-}
-
-unsafe fn selected_index(combo: HWND) -> Option<usize> {
-    let idx = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-    if idx < 0 {
-        None
-    } else {
-        Some(idx as usize)
     }
 }

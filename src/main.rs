@@ -2,13 +2,19 @@
 
 mod apps_dialog;
 mod audio;
+mod caster;
+mod caster_dialog;
 mod devices;
 mod dialog;
 mod hidden;
+mod mediasoup;
 mod mirror;
 mod mirror_dialog;
+mod opus;
 mod prism;
 mod routing;
+mod socketio;
+mod wasapi;
 
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +27,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, SetTimer, MSG, PM_REMOVE, WM_HOTKEY,
+    WM_TIMER,
 };
 
 const HK_PREV: i32 = 1;
@@ -39,12 +46,13 @@ const HK_DEVICES: i32 = 12;
 const HK_TOGGLE_MODE: i32 = 13;
 const HK_APPS: i32 = 14;
 const HK_MIRROR: i32 = 15;
+const HK_CAST: i32 = 16;
 
 const VOLUME_STEP: f32 = 0.02;
 
 // Spoken after the mode name whenever 0 switches modes.
-const APP_MODE_HELP: &str = "Left and Right select application, Up and Down change volume, Page Up and Page Down change volume by 20, Home sets 0 percent, End sets 100 percent, M toggles mute, Enter chooses devices for the application, Shift 0 chooses which applications to show, Shift Enter duplicates an output device to another device, Backspace restores all applications to 100 percent, 0 switches to device mode, Q quits.";
-const DEVICE_MODE_HELP: &str = "Left and Right select device, Up and Down change device volume, Page Up and Page Down change device volume by 20, Home sets 0 percent, End sets 100 percent, M toggles device mute, Enter enables or disables the device, Shift 0 chooses which devices to show, Shift Enter duplicates the selected output device to another device, Backspace restores all applications to 100 percent, 0 switches to application mode, Q quits.";
+const APP_MODE_HELP: &str = "Left and Right select application, Up and Down change volume, Page Up and Page Down change volume by 20, Home sets 0 percent, End sets 100 percent, M toggles mute, Enter chooses devices for the application, Shift 0 chooses which applications to show, Shift Enter duplicates an output device to another device, Shift S streams a device to a SonicRoom room, Backspace restores all applications to 100 percent, 0 switches to device mode, Q quits.";
+const DEVICE_MODE_HELP: &str = "Left and Right select device, Up and Down change device volume, Page Up and Page Down change device volume by 20, Home sets 0 percent, End sets 100 percent, M toggles device mute, Enter enables or disables the device, Shift 0 chooses which devices to show, Shift Enter duplicates the selected output device to another device, Shift S streams the selected device to a SonicRoom room, Backspace restores all applications to 100 percent, 0 switches to application mode, Q quits.";
 
 /// What Left/Right, Up/Down, M and Enter act on.
 #[derive(Clone, Copy, PartialEq)]
@@ -536,7 +544,182 @@ fn open_devices_dialog(nav: &mut DeviceNav, speaker: &Option<prism::Speaker>) {
     }
 }
 
-/// Shift+Enter with no duplication running: ask for source / target / latency
+/// Milliseconds between attempts to resume a wanted duplication or room
+/// stream that isn't running (a device is unplugged, the engine failed, the
+/// server is unreachable).
+const MIRROR_RETRY_MS: u32 = 5000;
+
+/// Output duplication: what the user asked for (`wanted`, persisted in
+/// `active_mirror.txt`) and the engine currently carrying it out. A wanted
+/// duplication that isn't running is retried on a timer and on every device
+/// change, so unplugging a device pauses it and plugging it back resumes it.
+struct Duplication {
+    wanted: Option<mirror::Active>,
+    running: Option<mirror::Mirror>,
+    /// Consecutive automatic starts that failed with both devices present.
+    failures: u32,
+    /// Last start error spoken, so a device that keeps refusing is announced
+    /// once rather than every retry.
+    spoken_error: Option<String>,
+}
+
+impl Duplication {
+    /// Startup: pick up the duplication that was wanted when audioman last
+    /// exited and start it if both devices are there.
+    fn load(speaker: &Option<prism::Speaker>, main_thread: u32) -> Duplication {
+        let mut dup = Duplication {
+            wanted: mirror::Active::load(),
+            running: None,
+            failures: 0,
+            spoken_error: None,
+        };
+        dup.try_resume(speaker, main_thread);
+        if dup.running.is_none() {
+            if let Some(w) = &dup.wanted {
+                say(
+                    speaker,
+                    &format!(
+                        "Duplicating {} to {} will start when both devices are available",
+                        w.source_name, w.target_name
+                    ),
+                );
+            }
+        }
+        dup
+    }
+
+    /// Start the wanted duplication if it isn't running and both of its
+    /// devices are active outputs. A missing device is not an error: it just
+    /// waits for the next retry.
+    fn try_resume(&mut self, speaker: &Option<prism::Speaker>, main_thread: u32) {
+        // WM_MIRROR_STOPPED is lost if it arrives while a dialog's nested
+        // loop runs; catch a dead engine here instead.
+        self.on_stopped(speaker);
+        if self.running.is_some() {
+            return;
+        }
+        let Some(wanted) = self.wanted.as_mut() else {
+            return;
+        };
+        let outputs = devices::outputs();
+        let find = |id: &str| {
+            outputs
+                .iter()
+                .find(|d| devices::id_string(&d.id).eq_ignore_ascii_case(id))
+        };
+        let (Some(source), Some(target)) = (find(&wanted.source_id), find(&wanted.target_id))
+        else {
+            // Only count failures that happen with both devices present.
+            self.failures = 0;
+            return;
+        };
+        match mirror::Mirror::start(
+            &source.id,
+            &source.name,
+            &target.id,
+            &target.name,
+            wanted.latency,
+            main_thread,
+        ) {
+            Ok(m) => {
+                wanted.source_name = source.name.clone();
+                wanted.target_name = target.name.clone();
+                wanted.save();
+                say(
+                    speaker,
+                    &format!(
+                        "Resumed duplicating {} to {}, about {} milliseconds delay",
+                        source.name,
+                        target.name,
+                        m.stats.estimated_delay_ms()
+                    ),
+                );
+                self.running = Some(m);
+                self.failures = 0;
+                self.spoken_error = None;
+            }
+            Err(e) => {
+                // A just-plugged-in device often refuses its first start
+                // while it settles; speak only when the failure persists.
+                self.failures += 1;
+                if self.failures >= 2 && self.spoken_error.as_deref() != Some(e.as_str()) {
+                    say(
+                        speaker,
+                        &format!(
+                            "Could not resume duplicating {} to {}: {}. Still retrying.",
+                            source.name, target.name, e
+                        ),
+                    );
+                    self.spoken_error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// If the engine stopped on its own, drop it but keep wanting it; retries
+    /// resume it once the devices are usable again. Checks the engine's own
+    /// failure flag, so a late WM_MIRROR_STOPPED from an engine already
+    /// replaced can't stop the healthy one.
+    fn on_stopped(&mut self, speaker: &Option<prism::Speaker>) {
+        let Some(reason) = self.running.as_ref().and_then(|m| m.failure()) else {
+            return;
+        };
+        let Some(m) = self.running.take() else {
+            return;
+        };
+        let target = m.target_name.clone();
+        drop(m);
+        self.failures = 0;
+        self.spoken_error = None;
+        say(
+            speaker,
+            &format!(
+                "Duplication to {} stopped: {}. It will resume when both devices are available.",
+                target, reason
+            ),
+        );
+    }
+
+    /// Shift+Enter: stop the running or waiting duplication, or ask for a
+    /// new one. Returns whether the dialog was shown.
+    fn toggle(
+        &mut self,
+        nav: &DeviceNav,
+        mode: Mode,
+        speaker: &Option<prism::Speaker>,
+        main_thread: u32,
+    ) -> bool {
+        self.failures = 0;
+        self.spoken_error = None;
+        if let Some(m) = self.running.take() {
+            let desc = format!("{} to {}", m.source_name, m.target_name);
+            drop(m);
+            self.wanted = None;
+            mirror::Active::clear();
+            say(speaker, &format!("Stopped duplicating {}", desc));
+            false
+        } else if let Some(w) = self.wanted.take() {
+            mirror::Active::clear();
+            say(
+                speaker,
+                &format!(
+                    "Cancelled duplicating {} to {}, which was waiting for its devices",
+                    w.source_name, w.target_name
+                ),
+            );
+            false
+        } else {
+            if let Some((active, m)) = open_mirror_dialog(nav, mode, speaker, main_thread) {
+                active.save();
+                self.wanted = Some(active);
+                self.running = Some(m);
+            }
+            true
+        }
+    }
+}
+
+/// Shift+Enter with no duplication wanted: ask for source / target / latency
 /// and start the mirror engine. The source combo opens on the device selected
 /// in device mode (or the default output), the target on the last-used one.
 fn open_mirror_dialog(
@@ -544,7 +727,7 @@ fn open_mirror_dialog(
     mode: Mode,
     speaker: &Option<prism::Speaker>,
     main_thread: u32,
-) -> Option<mirror::Mirror> {
+) -> Option<(mirror::Active, mirror::Mirror)> {
     let outputs = devices::outputs();
     if outputs.len() < 2 {
         say(speaker, "Duplicating needs at least two output devices");
@@ -588,7 +771,6 @@ fn open_mirror_dialog(
     let source = &outputs[choice.source];
     let target = &outputs[choice.target];
     mirror::Prefs::save(&target.id, choice.latency);
-
     match mirror::Mirror::start(
         &source.id,
         &source.name,
@@ -608,10 +790,311 @@ fn open_mirror_dialog(
                     m.stats.estimated_delay_ms()
                 ),
             );
-            Some(m)
+            let active = mirror::Active {
+                source_id: devices::id_string(&source.id),
+                target_id: devices::id_string(&target.id),
+                latency: choice.latency,
+                source_name: source.name.clone(),
+                target_name: target.name.clone(),
+            };
+            Some((active, m))
         }
         Err(e) => {
             say(speaker, &format!("Could not start duplication: {}", e));
+            None
+        }
+    }
+}
+
+/// Streaming a device into a SonicRoom room: what the user asked for
+/// (`wanted`, persisted in `active_sonicroom.txt` once it first goes live)
+/// and the engine carrying it out. Like [`Duplication`], a wanted stream that
+/// isn't running is retried on the timer and on every device change, so a
+/// dropped connection or an unplugged device pauses it rather than ending it.
+struct Casting {
+    wanted: Option<caster::Settings>,
+    running: Option<caster::Caster>,
+    /// Whether `wanted` has ever gone live. Until it has, a failure means the
+    /// start itself failed (wrong server, room refused, ...) and drops it
+    /// instead of retrying forever.
+    proven: bool,
+    /// Whether the running engine going live has been announced.
+    announced: bool,
+    /// Consecutive automatic attempts that failed before going live.
+    failures: u32,
+    /// Last retry error spoken, so a server that stays down is announced once.
+    spoken_error: Option<String>,
+}
+
+impl Casting {
+    /// Startup: pick up the stream that was wanted when audioman last exited.
+    fn load(speaker: &Option<prism::Speaker>, main_thread: u32) -> Casting {
+        let mut casting = Casting {
+            wanted: caster::Settings::load_active(),
+            running: None,
+            proven: true,
+            announced: false,
+            failures: 0,
+            spoken_error: None,
+        };
+        casting.try_resume(speaker, main_thread);
+        if casting.running.is_none() {
+            if let Some(w) = &casting.wanted {
+                say(
+                    speaker,
+                    &format!(
+                        "Streaming {} to room {} will start when the device is available",
+                        w.device_name, w.room
+                    ),
+                );
+            }
+        }
+        casting
+    }
+
+    /// Start the wanted stream if it isn't running and its device is active.
+    /// A missing device is not an error: it just waits for the next retry.
+    fn try_resume(&mut self, speaker: &Option<prism::Speaker>, main_thread: u32) {
+        // WM_CASTER_CHANGED is lost if it arrives while a dialog's nested
+        // loop runs; catch up here.
+        self.on_changed(speaker);
+        if self.running.is_some() || !self.proven {
+            return;
+        }
+        let Some(wanted) = &self.wanted else {
+            return;
+        };
+        let sources = caster::sources();
+        let Some(source) = sources
+            .iter()
+            .find(|s| devices::id_string(&s.id).eq_ignore_ascii_case(&wanted.device_id))
+        else {
+            // Only count failures that happen with the device present.
+            self.failures = 0;
+            return;
+        };
+        match caster::Caster::start(wanted, source, main_thread) {
+            Ok(c) => {
+                self.running = Some(c);
+                self.announced = false;
+            }
+            Err(e) => self.retry_failed(speaker, e),
+        }
+    }
+
+    /// An automatic attempt failed before going live. A just-plugged-in
+    /// device or a restarting server often refuses once; speak only when the
+    /// failure persists, and each distinct error once.
+    fn retry_failed(&mut self, speaker: &Option<prism::Speaker>, error: String) {
+        self.failures += 1;
+        if self.failures >= 2 && self.spoken_error.as_deref() != Some(error.as_str()) {
+            let room = self.wanted.as_ref().map(|w| w.room.as_str()).unwrap_or("");
+            say(
+                speaker,
+                &format!(
+                    "Could not resume streaming to room {}: {}. Still retrying.",
+                    room, error
+                ),
+            );
+            self.spoken_error = Some(error);
+        }
+    }
+
+    /// Follow the engine: announce it going live, drop it when it stops.
+    /// Reads the engine's own phase, so a late message from an engine that
+    /// was already replaced does nothing.
+    fn on_changed(&mut self, speaker: &Option<prism::Speaker>) {
+        let Some(phase) = self.running.as_ref().map(|c| c.phase()) else {
+            return;
+        };
+        match phase {
+            caster::Phase::Connecting => {}
+            caster::Phase::Live => {
+                let Some(c) = self.running.as_ref().filter(|_| !self.announced) else {
+                    return;
+                };
+                self.announced = true;
+                self.failures = 0;
+                self.spoken_error = None;
+                let s = &c.settings;
+                // Persisted from the first live moment on, refreshing the
+                // device name in case it changed.
+                s.save_active();
+                self.wanted = Some(s.clone());
+                if self.proven {
+                    say(
+                        speaker,
+                        &format!("Resumed streaming {} to room {}", s.device_name, s.room),
+                    );
+                } else {
+                    self.proven = true;
+                    say(
+                        speaker,
+                        &format!(
+                            "Streaming {} to room {}, {}, about {} milliseconds before the network. Press Shift S again to stop.",
+                            s.device_name,
+                            s.room,
+                            s.quality.name(),
+                            c.stats.estimated_delay_ms(s.quality)
+                        ),
+                    );
+                }
+            }
+            caster::Phase::Failed(reason) => {
+                let room = self
+                    .running
+                    .take()
+                    .map(|c| c.settings.room.clone())
+                    .unwrap_or_default();
+                if !self.proven {
+                    self.wanted = None;
+                    say(
+                        speaker,
+                        &format!("Could not stream to room {}: {}", room, reason),
+                    );
+                } else if self.announced {
+                    self.failures = 0;
+                    self.spoken_error = None;
+                    say(
+                        speaker,
+                        &format!(
+                            "Streaming to room {} stopped: {}. It will resume when possible.",
+                            room, reason
+                        ),
+                    );
+                } else {
+                    self.retry_failed(speaker, reason);
+                }
+            }
+            caster::Phase::Removed => {
+                let room = self
+                    .running
+                    .take()
+                    .map(|c| c.settings.room.clone())
+                    .unwrap_or_default();
+                self.wanted = None;
+                caster::Settings::clear_active();
+                say(
+                    speaker,
+                    &format!(
+                        "Someone in room {} removed the stream. Streaming stopped.",
+                        room
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Shift+S: stop the running or waiting stream, or ask for a new one.
+    /// Returns whether the dialog was shown.
+    fn toggle(
+        &mut self,
+        nav: &DeviceNav,
+        mode: Mode,
+        speaker: &Option<prism::Speaker>,
+        main_thread: u32,
+    ) -> bool {
+        self.failures = 0;
+        self.spoken_error = None;
+        if let Some(c) = self.running.take() {
+            let desc = format!("{} to room {}", c.settings.device_name, c.settings.room);
+            drop(c);
+            self.wanted = None;
+            caster::Settings::clear_active();
+            say(speaker, &format!("Stopped streaming {}", desc));
+            false
+        } else if let Some(w) = self.wanted.take() {
+            caster::Settings::clear_active();
+            say(
+                speaker,
+                &format!(
+                    "Cancelled streaming {} to room {}, which was waiting for its device",
+                    w.device_name, w.room
+                ),
+            );
+            false
+        } else {
+            if let Some(c) = open_cast_dialog(nav, mode, speaker, main_thread) {
+                self.wanted = Some(c.settings.clone());
+                self.running = Some(c);
+                self.proven = false;
+                self.announced = false;
+            }
+            true
+        }
+    }
+}
+
+/// Shift+S with no stream wanted: ask where and what to stream, remember the
+/// answers, and start connecting. The device combo opens on the device
+/// selected in device mode, else the last one streamed, else the default
+/// output.
+fn open_cast_dialog(
+    nav: &DeviceNav,
+    mode: Mode,
+    speaker: &Option<prism::Speaker>,
+    main_thread: u32,
+) -> Option<caster::Caster> {
+    let sources = caster::sources();
+    if sources.is_empty() {
+        say(speaker, "No audio devices to stream");
+        return None;
+    }
+    let mut prefs = caster::Settings::load_prefs();
+    let find = |id: &str| {
+        sources
+            .iter()
+            .position(|s| devices::id_string(&s.id).eq_ignore_ascii_case(id))
+    };
+    let device_idx = match mode {
+        Mode::Devices => nav
+            .current()
+            .filter(|e| e.enabled)
+            .and_then(|e| find(&devices::id_string(&e.id))),
+        Mode::Apps => None,
+    }
+    .or_else(|| find(&prefs.device_id))
+    .or_else(|| devices::default_output_id().and_then(|id| find(&devices::id_string(&id))))
+    .unwrap_or(0);
+
+    let choice = caster_dialog::show(&sources, device_idx, &prefs)?;
+    let source = &sources[choice.device];
+    // A pasted room link names the room too.
+    prefs.room = if choice.room.is_empty() {
+        socketio::room_from_link(&choice.server).unwrap_or_default()
+    } else {
+        choice.room
+    };
+    prefs.server = choice.server;
+    if !choice.name.is_empty() {
+        prefs.name = choice.name;
+    }
+    prefs.device_id = devices::id_string(&source.id);
+    prefs.device_name = source.name.clone();
+    prefs.channels = choice.channels;
+    prefs.quality = choice.quality;
+    // Remember the answers even when they are rejected below, so fixing a
+    // typo doesn't mean retyping everything.
+    prefs.save_prefs();
+
+    if prefs.server.is_empty() {
+        say(speaker, "Enter the SonicRoom server address or a room link");
+        return None;
+    }
+    if !caster::valid_room(&prefs.room) {
+        say(
+            speaker,
+            "Enter a room name using only letters, digits, hyphens and underscores",
+        );
+        return None;
+    }
+    match caster::Caster::start(&prefs, source, main_thread) {
+        Ok(c) => {
+            say(speaker, &format!("Connecting to room {}", prefs.room));
+            Some(c)
+        }
+        Err(e) => {
+            say(speaker, &format!("Could not start streaming: {}", e));
             None
         }
     }
@@ -634,7 +1117,6 @@ fn main() {
     let state = manager.state.clone();
     let mut mode = Mode::Apps;
     let mut nav = DeviceNav::new();
-    let mut mirror: Option<mirror::Mirror> = None;
 
     unsafe {
         let h = HWND(std::ptr::null_mut());
@@ -653,9 +1135,15 @@ fn main() {
         let _ = RegisterHotKey(h, HK_TOGGLE_MODE, mods(), b'0' as u32);
         let _ = RegisterHotKey(h, HK_APPS, shift_mods(), b'0' as u32);
         let _ = RegisterHotKey(h, HK_MIRROR, shift_mods(), VK_RETURN.0 as u32);
+        let _ = RegisterHotKey(h, HK_CAST, shift_mods(), b'S' as u32);
     }
 
     say(&speaker, "Audio manager ready");
+    let mut duplication = Duplication::load(&speaker, main_thread);
+    let mut casting = Casting::load(&speaker, main_thread);
+    // Thread timer (null hwnd): WM_TIMER lands in the thread queue carrying
+    // the id SetTimer returns.
+    let retry_timer = unsafe { SetTimer(HWND(std::ptr::null_mut()), 0, MIRROR_RETRY_MS, None) };
 
     let mut msg = MSG::default();
     loop {
@@ -762,12 +1250,14 @@ fn main() {
                     manager.rebuild();
                 }
                 HK_MIRROR => {
-                    if let Some(m) = mirror.take() {
-                        let desc = format!("{} to {}", m.source_name, m.target_name);
-                        drop(m);
-                        say(&speaker, &format!("Stopped duplicating {}", desc));
-                    } else {
-                        mirror = open_mirror_dialog(&nav, mode, &speaker, main_thread);
+                    if duplication.toggle(&nav, mode, &speaker, main_thread) {
+                        // Catch up on device notifications dropped by the
+                        // nested dialog loop.
+                        manager.rebuild();
+                    }
+                }
+                HK_CAST => {
+                    if casting.toggle(&nav, mode, &speaker, main_thread) {
                         // Catch up on device notifications dropped by the
                         // nested dialog loop.
                         manager.rebuild();
@@ -801,16 +1291,21 @@ fn main() {
             if mode == Mode::Devices {
                 nav.refresh();
             }
+            // A device coming back resumes a paused duplication or stream
+            // right away instead of on the next retry tick.
+            duplication.try_resume(&speaker, main_thread);
+            casting.try_resume(&speaker, main_thread);
         } else if msg.message == mirror::WM_MIRROR_STOPPED && msg.hwnd.0.is_null() {
-            if let Some(m) = mirror.take() {
-                let reason = m.failure().unwrap_or_else(|| "unknown error".to_string());
-                let target = m.target_name.clone();
-                drop(m);
-                say(
-                    &speaker,
-                    &format!("Duplication to {} stopped: {}", target, reason),
-                );
-            }
+            duplication.on_stopped(&speaker);
+        } else if msg.message == caster::WM_CASTER_CHANGED && msg.hwnd.0.is_null() {
+            casting.on_changed(&speaker);
+        } else if msg.message == WM_TIMER
+            && msg.hwnd.0.is_null()
+            && retry_timer != 0
+            && msg.wParam.0 == retry_timer
+        {
+            duplication.try_resume(&speaker, main_thread);
+            casting.try_resume(&speaker, main_thread);
         }
 
         unsafe {
@@ -835,9 +1330,14 @@ fn main() {
         let _ = UnregisterHotKey(h, HK_TOGGLE_MODE);
         let _ = UnregisterHotKey(h, HK_APPS);
         let _ = UnregisterHotKey(h, HK_MIRROR);
+        let _ = UnregisterHotKey(h, HK_CAST);
+        if retry_timer != 0 {
+            let _ = KillTimer(h, retry_timer);
+        }
     }
 
-    drop(mirror);
+    drop(casting);
+    drop(duplication);
     drop(manager);
     drop(speaker);
 
